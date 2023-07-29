@@ -9,7 +9,7 @@ def preprocess_causal_lm(tokenizer, bptt:int, ds_name:str):
         result = tokenizer([text], add_special_tokens=False)
         return result
 
-    block_size = bptt
+    block_size = bptt -1
 
     def group_texts(examples):
         # Concatenate all texts.
@@ -29,6 +29,7 @@ def preprocess_causal_lm(tokenizer, bptt:int, ds_name:str):
         result["input_ids"] = added_tokens
         shifted_labels = [ids[1:] + [tokenizer.eos_token_id] for ids in result["input_ids"]]
         result["labels"] = shifted_labels
+        result['attention_mask'] = [mask + [1] for mask in result['attention_mask']]
         return result
 
     if ds_name == "wiki2":

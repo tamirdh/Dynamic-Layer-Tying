@@ -1,3 +1,5 @@
+import datetime
+
 import torch.cuda
 import transformers
 from accelerate import Accelerator
@@ -7,6 +9,9 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from loaders import preprocess_causal_lm
 from models import Transformer
+from modified_gpt2_model import IterativeGPTConfig, IterativeGPT
+from vanilla_models import VanillaTransformer
+from gpt2_model import GPT, GPTConfig
 import argparse
 from accelerate.utils import LoggerType
 from torchinfo import summary
@@ -16,8 +21,19 @@ def setup(args, accelerator):
     tokenizer_id = args.token
     accelerator.print(f'Using {tokenizer_id}\'s tokenizer')
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
-    model = Transformer(len(tokenizer), args.emsize, args.nhead, args.emsize * 4, 0.2, accelerator.device, args.k,
-                        args.nlayers, args.bptt + 1)
+    if args.vanilla:
+        model = VanillaTransformer(len(tokenizer), args.emsize, args.nhead, args.nlayers, args.emsize * 4,
+                                   args.bptt + 1, 0.2, 0.2)
+    elif args.gpt:
+        config = GPTConfig(args.bptt + 1, len(tokenizer), args.nlayers, args.nhead, args.emsize, 0.2)
+        model = GPT(config)
+    else:
+        # model = Transformer(len(tokenizer), args.emsize, args.nhead, args.emsize * 4, 0.2, accelerator.device, args.k,
+        #                     args.nlayers, args.bptt + 1, new=True)
+
+        config = IterativeGPTConfig(args.bptt + 1, len(tokenizer), args.nlayers, args.nhead, args.emsize, 0.2, k=args.k, factor=args.factor)
+        model = IterativeGPT(config)
+    model = model.bfloat16()
     # model = torch.compile(model)
     return model, tokenizer
 
@@ -29,7 +45,7 @@ def init_args():
     parser.add_argument('--bptt', type=int, default=1024, help='sequence length (used only in wiki2)')
     parser.add_argument('--epochs', type=int, default=200, help='number of training epochs')
     parser.add_argument('--dataset', type=str, help='Dataset to use',
-                        choices=['wiki2', "wiki103", "1b", "lambada", "ptb"])
+                        choices=['wiki2', "wiki103", "1b", "lambada", "ptb", "shake"])
     parser.add_argument('--nhead', type=int, default=16, help='number of attention heads')
     parser.add_argument('--nlayers', type=int, default=12,
                         help='number of decoder blocks')
@@ -37,7 +53,11 @@ def init_args():
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
     parser.add_argument('--token', default='gpt2-xl')
     parser.add_argument('--overfit', action='store_true')
-    parser.add_argument('--k', type=int, default=4, help="Number of inner iterations in transformer blocks")
+    parser.add_argument('--k', type=int, default=4, help="switch layer")
+    parser.add_argument('--factor', type=float, default=0.75)
+    parser.add_argument('--exp', help="Experiment name")
+    parser.add_argument("--vanilla", action='store_true', help="Use a vanilla version of Transformers")
+    parser.add_argument("--gpt", action='store_true', help="Use a GPT version of Transformers")
     args = parser.parse_args()
     return args
 
@@ -45,7 +65,7 @@ def init_args():
 def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args, accelerator: Accelerator):
     lr = args.lr
     device = accelerator.device
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=1e-3)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.01)
     ignore = -100 if tokenizer.pad_token_id is None else tokenizer.pad_token_id
     loss_function = torch.nn.CrossEntropyLoss(ignore_index=ignore)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False)
@@ -53,7 +73,7 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
     model, optimizer, train_loader, test_loader = accelerator.prepare(model, optimizer, train_loader, test_loader)
     model.to(device)
     if accelerator.is_local_main_process:
-        summary(model, input_data=train_dataset[0]['input_ids'].unsqueeze(0), depth=5)
+        summary(model, input_data=train_dataset[0]['input_ids'].unsqueeze(0).to(accelerator.device), depth=5)
     accelerator.register_for_checkpointing(model)
     accelerator.print(f'LEN TRAIN: {len(train_loader.dataset)}')
     accelerator.print(f'LEN TEST: {len(test_loader.dataset)}')
@@ -72,6 +92,8 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
             targets = targets.to(device)
             outputs, _ = model(inputs)
             loss = loss_function(outputs.reshape(-1, len(tokenizer)), targets.reshape(-1))
+            # Store the current experience in the replay buffer
+
             train_loss += loss.item()
             accelerator.backward(loss)
             avg_grads = []
@@ -115,13 +137,24 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
                     acc = acc.item() / (targets.shape[0] * targets.shape[1])
                     eval_acc += acc
                     counter += 1
+                generated_text = gen_text(model, tokenizer, "Most of what is known of Du Fu 's life comes", device)[0]
+                accelerator.print(f"\nText:{generated_text}\n")
                 perplexity_score = torch.exp(torch.tensor([eval_total_loss / counter])).item()
+
+                accelerator.log({'Generated_Text': generated_text}, step=epoch + 1)
                 accelerator.log({f"perplexity_score ({ds})": perplexity_score}, step=epoch + 1)
                 accelerator.print(f'Post epoch {epoch + 1} ({ds}): {perplexity_score}')
                 accelerator.print(f'Accuracy: {eval_acc / counter}')
             # accelerator.save_state()
             if eval_acc / counter >= 0.99:
                 break
+
+
+def gen_text(model, tokenizer, text, device):
+    input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
+    generated = model.module.generate(input_ids, 20)
+    generated_text = tokenizer.batch_decode(generated)
+    return generated_text
 
 
 def count_parameters(model, accelerator: Accelerator):
@@ -137,8 +170,15 @@ def count_parameters(model, accelerator: Accelerator):
 
 def main():
     args = init_args()
+    if args.vanilla:
+        model_name = "Vanilla"
+    elif args.gpt:
+        model_name = "GPT"
+    else:
+        model_name = "Mine"
+    now = datetime.datetime.now()
     proj_config = ProjectConfiguration(
-        project_dir=f"./exp/{args.dataset}-{args.bptt} tokens-{args.nlayers} layers- {args.k} iterations",
+        project_dir=f"./exp/{model_name}-{args.exp}-{now}",
         automatic_checkpoint_naming=True,
         total_limit=4)
     accelerator = Accelerator(project_config=proj_config, log_with=LoggerType.TENSORBOARD)
@@ -146,7 +186,7 @@ def main():
     torch.cuda.empty_cache()
     accelerator.print(f'device={accelerator.device}')
     hps = {"epochs": args.epochs, "learning_rate": args.lr, "bptt": args.bptt}
-    accelerator.init_trackers(f'{args.dataset}-{args.bptt} tokens-{args.nlayers} layers- {args.k} iterations',
+    accelerator.init_trackers(f'{model_name}-{now}',
                               config=hps)
     model, tokenizer = setup(args, accelerator)
     # count_parameters(model, accelerator)

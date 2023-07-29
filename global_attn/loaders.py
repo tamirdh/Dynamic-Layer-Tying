@@ -41,6 +41,8 @@ def preprocess_causal_lm(tokenizer, bptt: int, ds_name: str):
         dataset = load_dataset("ptb_text_only")
     elif ds_name == "1b":
         dataset = load_dataset("lm1b")
+    elif ds_name == "shake":
+        dataset = load_dataset('tiny_shakespeare')
     else:
         raise RuntimeError(f"Unrecognized DS name: {ds_name}")
 

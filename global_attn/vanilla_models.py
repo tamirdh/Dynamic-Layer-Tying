@@ -212,3 +212,33 @@ if __name__ == '__main__':
     # Print the attention masks
     print("Attention Masks:")
     print(src_mask[0, 0])  # Print the first mask for visualization
+
+import math
+
+# Define the VanillaTransformer class with the correct TransformerEncoder
+class VanillaTransformer(torch.nn.Module):
+    def __init__(self, vocab_size, d_model, nhead, num_layers, dim_feedforward, max_seq_len, pos_dropout, trans_dropout):
+        super().__init__()
+
+        self.d_model = d_model
+        self.embed = torch.nn.Embedding(vocab_size, d_model)
+        self.pos_enc = torch.nn.Embedding(max_seq_len, d_model)
+        self.pos_dropout = torch.nn.Dropout(pos_dropout)
+
+        encoder_layer = torch.nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, trans_dropout)
+        self.transformer = torch.nn.TransformerEncoder(encoder_layer, num_layers)
+        self.fc_out = torch.nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        seq_len, N = x.size()
+        pos = torch.arange(0, seq_len).unsqueeze(1).repeat(1, N).to(x.device)  # (seq_len, N)
+
+        embedding = self.embed(x) * math.sqrt(self.d_model)  # (seq_len, N, d_model)
+        pos_encoding = self.pos_enc(pos)  # (seq_len, N, d_model)
+
+        x = self.pos_dropout(embedding + pos_encoding)
+
+        x = self.transformer(x)
+        x = self.fc_out(x)
+
+        return x, None
