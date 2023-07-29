@@ -142,16 +142,19 @@ class Hypernetwork(nn.Module):
         if n_params >= 10_000:
             kernel = 5
             padding = 2
-            output_size = 59
+            output_size = 100
             n_channels = 20
             net = nn.Sequential(nn.Embedding(config.n_layer, config.n_embd),
                                 nn.Conv1d(1, n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
                                 nn.MaxPool1d(2),
                                 nn.Conv1d(n_channels, 2*n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
                                 nn.MaxPool1d(2),
-                                nn.Conv1d(2*n_channels, 3*n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
+                                nn.Conv1d(2*n_channels, 4*n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
                                 nn.MaxPool1d(2),
-                                nn.Linear(output_size, n_params//(3*n_channels))
+                                nn.Conv1d(4*n_channels, 10*n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
+                                nn.MaxPool1d(2),
+                                nn.Conv1d(10*n_channels, n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
+                                nn.Linear(output_size, n_params//(n_channels))
                                 )
         else:
             net = nn.Sequential(nn.Embedding(config.n_layer, 256),
