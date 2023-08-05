@@ -73,10 +73,11 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
     model, optimizer, train_loader, test_loader = accelerator.prepare(model, optimizer, train_loader, test_loader)
     model.to(device)
     if accelerator.is_local_main_process:
-        summary(model, input_data=train_dataset[0]['input_ids'].unsqueeze(0).to(accelerator.device), depth=5)
+        summary(model, input_data=train_dataset[0]['input_ids'].unsqueeze(0).to(accelerator.device), depth=3)
     accelerator.register_for_checkpointing(model)
     accelerator.print(f'LEN TRAIN: {len(train_loader.dataset)}')
     accelerator.print(f'LEN TEST: {len(test_loader.dataset)}')
+    best_ppl = float('inf')
     for epoch in range(args.epochs):
         model.train()
         bar = tqdm(train_loader, desc="TRAIN", leave=True, disable=not accelerator.is_local_main_process)
@@ -140,9 +141,11 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
                 generated_text = gen_text(model, tokenizer, "Most of what is known of Du Fu 's life comes", device)[0]
                 accelerator.print(f"\nText:{generated_text}\n")
                 perplexity_score = torch.exp(torch.tensor([eval_total_loss / counter])).item()
-
+                if perplexity_score < best_ppl:
+                    best_ppl = perplexity_score
                 accelerator.log({'Generated_Text': generated_text}, step=epoch + 1)
                 accelerator.log({f"perplexity_score ({ds})": perplexity_score}, step=epoch + 1)
+                accelerator.log({f"Best PPL ({ds})": best_ppl}, step=epoch + 1)
                 accelerator.print(f'Post epoch {epoch + 1} ({ds}): {perplexity_score}')
                 accelerator.print(f'Accuracy: {eval_acc / counter}')
             # accelerator.save_state()

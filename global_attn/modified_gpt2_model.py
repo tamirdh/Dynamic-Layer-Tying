@@ -111,7 +111,13 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+class Reshape(nn.Module):
+    def __init__(self, *args):
+        super(Reshape, self).__init__()
+        self.shape = args
 
+    def forward(self, x):
+        return x.view(self.shape)
 @dataclass
 class IterativeGPTConfig:
     block_size: int = 1024
@@ -135,26 +141,29 @@ class Hypernetwork(nn.Module):
         self.block_weight_gen = nn.ModuleList(
             [self._create_net_for_block(p, config) for p in
              self.transformer_block.parameters()])
+        total_params = sum(p.numel() for p in self.transformer_block.parameters())
+        out_shape = torch.cat([layer(torch.ones([1], dtype=torch.long)).flatten() for layer in self.block_weight_gen], dim=-1).shape
+        assert out_shape[0] == total_params, f'Missing some parameters in generation, got {out_shape[0]:, } out of {total_params:,}'
 
     @staticmethod
     def _create_net_for_block(p: nn.Parameter, config):
         n_params = p.numel()
         if n_params >= 10_000:
-            kernel = 5
-            padding = 2
-            output_size = 100
-            n_channels = 20
+            kernel = 10
+            padding = 0
+            stride = 1
+            output_size = 91
+            n_channels = 10
             net = nn.Sequential(nn.Embedding(config.n_layer, config.n_embd),
-                                nn.Conv1d(1, n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
+                                nn.Conv1d(1, n_channels, kernel_size=kernel, padding=padding, stride = stride), nn.ELU(),
                                 nn.MaxPool1d(2),
-                                nn.Conv1d(n_channels, 2*n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
+                                nn.Conv1d(n_channels, 2*n_channels, kernel_size=kernel, padding=padding, stride = stride), nn.ELU(),
                                 nn.MaxPool1d(2),
-                                nn.Conv1d(2*n_channels, 4*n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
+                                nn.Conv1d(2*n_channels, n_channels, kernel_size=kernel, padding=padding, stride = stride), nn.ELU(),
                                 nn.MaxPool1d(2),
-                                nn.Conv1d(4*n_channels, 10*n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
+                                nn.Conv1d(n_channels, n_channels, kernel_size=kernel, padding=padding, stride = stride), nn.ELU(),
                                 nn.MaxPool1d(2),
-                                nn.Conv1d(10*n_channels, n_channels, kernel_size=kernel, padding=padding), nn.ELU(),
-                                nn.Linear(output_size, n_params//(n_channels))
+                                nn.Linear(output_size, n_params//n_channels)
                                 )
         else:
             net = nn.Sequential(nn.Embedding(config.n_layer, 256),
