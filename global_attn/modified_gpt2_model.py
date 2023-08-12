@@ -117,7 +117,7 @@ class Reshape(nn.Module):
         self.shape = args
 
     def forward(self, x):
-        return x.view(self.shape)
+        return x.reshape(self.shape)
 @dataclass
 class IterativeGPTConfig:
     block_size: int = 1024
@@ -138,54 +138,56 @@ class Hypernetwork(nn.Module):
         # Initialize the transformer block and weight generator
         self.transformer_block = Block(config)
         self.transformer_block.requires_grad_(False)
+        self.hyper_lstm = nn.LSTM(input_size=config.n_embd + 2, hidden_size=config.n_embd, num_layers=2, batch_first=True)
         self.block_weight_gen = nn.ModuleList(
             [self._create_net_for_block(p, config) for p in
              self.transformer_block.parameters()])
-        total_params = sum(p.numel() for p in self.transformer_block.parameters())
-        out_shape = torch.cat([layer(torch.ones([1], dtype=torch.long)).flatten() for layer in self.block_weight_gen], dim=-1).shape
-        assert out_shape[0] == total_params, f'Missing some parameters in generation, got {out_shape[0]:, } out of {total_params:,}'
+        # total_params = sum(p.numel() for p in self.transformer_block.parameters())
+        # out_shape = torch.cat([layer(torch.ones([1], dtype=torch.long)).flatten() for layer in self.block_weight_gen], dim=-1).shape
+        # assert out_shape[0] == total_params, f'Missing some parameters in generation, got {out_shape[0]:, } out of {total_params:,}'
 
     @staticmethod
     def _create_net_for_block(p: nn.Parameter, config):
         n_params = p.numel()
-        if n_params >= 10_000:
-            kernel = 10
-            padding = 0
-            stride = 1
-            output_size = 91
-            n_channels = 10
-            net = nn.Sequential(nn.Embedding(config.n_layer, config.n_embd),
-                                nn.Conv1d(1, n_channels, kernel_size=kernel, padding=padding, stride = stride), nn.ELU(),
-                                nn.MaxPool1d(2),
-                                nn.Conv1d(n_channels, 2*n_channels, kernel_size=kernel, padding=padding, stride = stride), nn.ELU(),
-                                nn.MaxPool1d(2),
-                                nn.Conv1d(2*n_channels, n_channels, kernel_size=kernel, padding=padding, stride = stride), nn.ELU(),
-                                nn.MaxPool1d(2),
-                                nn.Conv1d(n_channels, n_channels, kernel_size=kernel, padding=padding, stride = stride), nn.ELU(),
-                                nn.MaxPool1d(2),
-                                nn.Linear(output_size, n_params//n_channels)
-                                )
+        if n_params < 10_000:
+            net = nn.Sequential(nn.Linear(config.n_embd, 10), nn.ReLU(), nn.Linear(10, n_params))
         else:
-            net = nn.Sequential(nn.Embedding(config.n_layer, 256),
-                                nn.Linear(256, 1024),
-                                nn.ELU(),
-                                nn.Linear(1024, 4096),
-                                nn.ELU(),
-                                nn.Linear(4096, n_params))
+            # input shaped [B, D]
+            net = nn.Sequential(Reshape((-1, 4, 400)), nn.Linear(400, 1600), nn.ReLU(),
+                                Reshape((-1, 16, 400)), nn.Linear(400, 1600), nn.ReLU(),
+                                Reshape((-1, 64, 400)), nn.Linear(400, 1600), nn.ReLU(),
+                                Reshape((-1, 256, 400)), nn.Linear(400, 1600), nn.ReLU(),
+                                Reshape((-1, 1024, 400)), nn.Linear(400, 1600), nn.ReLU(),
+                                Reshape((-1, 4096, 400)), nn.Linear(400, n_params//4096), nn.ReLU(),
+                                )
         return net
 
     def forward(self, x, block_num):
         # block_num: [1]
         # x: [B, L, D]
+        # Take the first element in the sequence and calculate it's average
+        avg_first = x[:,0, :].mean(dim=0) # [D]
+        h_n, c_n  = None, None
+        block_weights = list()
+        for index, module in enumerate(self.block_weight_gen):
+            inner_index = torch.full([1], index, dtype=x.dtype, device=x.device)
+            avg_with_block = torch.cat([avg_first, block_num, inner_index]).unsqueeze(0).contiguous() # [D + 2]
+            if h_n is None:
+                lstm_out, (h_n, c_n) = self.hyper_lstm(avg_with_block)
+            else:
+                lstm_out, (h_n, c_n) = self.hyper_lstm(avg_with_block, (h_n, c_n))
+            weights = module(lstm_out)
+            block_weights.append(weights.flatten(0))
+
         # Generate weights for the transformer block
-        block_weights = torch.cat([layer(block_num).flatten() for layer in self.block_weight_gen], dim=-1)
+        block_weights = torch.cat(block_weights, dim=-1).squeeze(0)
 
         # Update weights of the transformer block
         # self._update_weights(self.transformer_block, block_weights)
         weights = self._map_weights(self.transformer_block, block_weights)
         # Pass the input through the transformer block
         x = functional_call(self.transformer_block, weights, x)
-        return x
+        return x, h_n, c_n
 
     @staticmethod
     def _update_weights(layer, weights):
@@ -274,7 +276,7 @@ class IterativeGPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         for index in range(0, self.config.n_layer):
             block_num = torch.full((1,), index, device=x.device, dtype=torch.long)
-            x = self.transformer.h(x, block_num)
+            x, h_n, c_n = self.transformer.h(x, block_num)
 
         x = self.transformer.ln_f(x)
 

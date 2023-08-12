@@ -33,7 +33,7 @@ def setup(args, accelerator):
 
         config = IterativeGPTConfig(args.bptt + 1, len(tokenizer), args.nlayers, args.nhead, args.emsize, 0.2, k=args.k, factor=args.factor)
         model = IterativeGPT(config)
-    model = model.bfloat16()
+    # model = model.float16()
     # model = torch.compile(model)
     return model, tokenizer
 
@@ -68,7 +68,7 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.01)
     ignore = -100 if tokenizer.pad_token_id is None else tokenizer.pad_token_id
     loss_function = torch.nn.CrossEntropyLoss(ignore_index=ignore)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(eval_dataset, batch_size=args.eval_batch_size, shuffle=False)
     model, optimizer, train_loader, test_loader = accelerator.prepare(model, optimizer, train_loader, test_loader)
     model.to(device)
