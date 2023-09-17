@@ -9,8 +9,8 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-from dataclasses import dataclass
-from torch.func import functional_call
+from dataclasses import dataclass, field
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -111,15 +111,9 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-class Reshape(nn.Module):
-    def __init__(self, *args):
-        super(Reshape, self).__init__()
-        self.shape = args[0]
 
-    def forward(self, x):
-        return x.reshape(self.shape)
 @dataclass
-class IterativeGPTConfig:
+class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -127,93 +121,9 @@ class IterativeGPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    factor: float = 1.0
-    k: int = 1
 
 
-class Hypernetwork(nn.Module):
-    def __init__(self, config):
-        super(Hypernetwork, self).__init__()
-
-        # Initialize the transformer block and weight generator
-        self.transformer_block = Block(config)
-        self.transformer_block.requires_grad_(False)
-        self.hyper_lstm = nn.LSTM(input_size=config.n_embd + 2, hidden_size=config.n_embd, num_layers=2, batch_first=True)
-        self.block_weight_gen = nn.ModuleList(
-            [self._create_net_for_block(p, config) for p in
-             self.transformer_block.parameters()])
-        # total_params = sum(p.numel() for p in self.transformer_block.parameters())
-        # out_shape = torch.cat([layer(torch.ones([1], dtype=torch.long)).flatten() for layer in self.block_weight_gen], dim=-1).shape
-        # assert out_shape[0] == total_params, f'Missing some parameters in generation, got {out_shape[0]:, } out of {total_params:,}'
-
-    @staticmethod
-    def _create_net_for_block(p: nn.Parameter, config):
-        n_params = p.numel()
-        if n_params < 10_000:
-            net = nn.Sequential(nn.Linear(config.n_embd, 10), nn.ReLU(), nn.Linear(10, n_params))
-        else:
-            # input shaped [B, D]
-            net = nn.Sequential(Reshape((-1, 4, 400)), nn.Linear(400, 1600), nn.ReLU(),
-                                Reshape((-1, 16, 400)), nn.Linear(400, 1600), nn.ReLU(),
-                                Reshape((-1, 64, 400)), nn.Linear(400, 1600), nn.ReLU(),
-                                Reshape((-1, 256, 400)), nn.Linear(400, 1600), nn.ReLU(),
-                                Reshape((-1, 1024, 400)), nn.Linear(400, 1600), nn.ReLU(),
-                                Reshape((-1, 4096, 400)), nn.Linear(400, n_params//4096), nn.ReLU(),
-                                )
-        return net
-
-    def forward(self, x, block_num):
-        # block_num: [1]
-        # x: [B, L, D]
-        # Take the first element in the sequence and calculate it's average
-        avg_first = x[:,0, :].mean(dim=0) # [D]
-        h_n, c_n  = None, None
-        block_weights = list()
-        for index, module in enumerate(self.block_weight_gen):
-            inner_index = torch.full([1], index, dtype=x.dtype, device=x.device)
-            avg_with_block = torch.cat([avg_first, block_num, inner_index]).unsqueeze(0).contiguous() # [D + 2]
-            if h_n is None:
-                lstm_out, (h_n, c_n) = self.hyper_lstm(avg_with_block)
-            else:
-                lstm_out, (h_n, c_n) = self.hyper_lstm(avg_with_block, (h_n, c_n))
-            weights = module(lstm_out)
-            block_weights.append(weights.flatten(0))
-
-        # Generate weights for the transformer block
-        block_weights = torch.cat(block_weights, dim=-1).squeeze(0)
-
-        # Update weights of the transformer block
-        # self._update_weights(self.transformer_block, block_weights)
-        weights = self._map_weights(self.transformer_block, block_weights)
-        # Pass the input through the transformer block
-        x = functional_call(self.transformer_block, weights, x)
-        return x, h_n, c_n
-
-    @staticmethod
-    def _update_weights(layer, weights):
-        # Update the weights of a given layer
-        shape_dict = {name: param.shape for name, param in layer.named_parameters()}
-        ptr = 0
-        for name, param in layer.named_parameters():
-            num_weights = torch.prod(torch.tensor(shape_dict[name])).item()
-            new_weights = weights[ptr: ptr + num_weights].view(shape_dict[name])
-            param.data.copy_(new_weights)
-            ptr += num_weights
-
-    @staticmethod
-    def _map_weights(layer, weights):
-        shape_dict = {name: param.shape for name, param in layer.named_parameters()}
-        ptr = 0
-        weights_map = dict()
-        for name, param in layer.named_parameters():
-            num_weights = torch.prod(torch.tensor(shape_dict[name])).item()
-            new_weights = weights[ptr: ptr + num_weights].view(shape_dict[name])
-            weights_map[name] = new_weights
-            ptr += num_weights
-        return weights_map
-
-
-class IterativeGPT(nn.Module):
+class QuantumGPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -224,9 +134,18 @@ class IterativeGPT(nn.Module):
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             wpe=nn.Embedding(config.block_size, config.n_embd),
             drop=nn.Dropout(config.dropout),
-            h=Hypernetwork(config),
+            trainable_blocks=nn.ModuleList([Block(config) for _ in range(config.n_layer // 2)]),
+            non_trainable_blocks=nn.ModuleList([Block(config) for _ in range(config.n_layer // 2)]),
             ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
+        # Initially entangle the weights by making them equal
+        for trainable_block, non_trainable_block in zip(self.transformer.trainable_blocks, self.transformer.non_trainable_blocks):
+            for trainable_param, non_trainable_param in zip(trainable_block.parameters(), non_trainable_block.parameters()):
+                # Clone the trainable parameter data to the non-trainable parameter
+                non_trainable_param.data = trainable_param.data.clone()
+                # Make sure PyTorch doesn't try to update this non-trainable parameter
+                non_trainable_param.requires_grad = False
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -243,6 +162,37 @@ class IterativeGPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+
+    def enforce_conservation(self):
+        # Enforce conservation of weight sum for entangled blocks
+        for trainable_block, non_trainable_block in zip(self.transformer.trainable_blocks,
+                                                        self.transformer.non_trainable_blocks):
+
+            for trainable_param, non_trainable_param in zip(trainable_block.parameters(),
+                                                            non_trainable_block.parameters()):
+                # Calculate the sum of the weights in the trainable parameter
+                weight_sum = trainable_param.data.sum()
+
+                # Update the non-trainable parameter to conserve the sum
+                non_trainable_param.data = weight_sum - trainable_param.data
+
+                # Make sure PyTorch doesn't try to update this non-trainable parameter
+                non_trainable_param.requires_grad = False
+    def switch_trainable_blocks(self):
+        # Switch the trainable status of each entangled pair
+        for trainable_block, non_trainable_block in zip(self.transformer.trainable_blocks, self.transformer.non_trainable_blocks):
+            trainable_state_dict = trainable_block.state_dict()
+            non_trainable_state_dict = non_trainable_block.state_dict()
+
+            trainable_block.load_state_dict(non_trainable_state_dict)
+            non_trainable_block.load_state_dict(trainable_state_dict)
+
+            # Toggle the requires_grad flag
+            for param in trainable_block.parameters():
+                param.requires_grad = not param.requires_grad
+            for param in non_trainable_block.parameters():
+                param.requires_grad = not param.requires_grad
+
 
     def get_num_params(self, non_embedding=True):
         """
@@ -274,10 +224,10 @@ class IterativeGPT(nn.Module):
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for index in range(0, self.config.n_layer):
-            block_num = torch.full((1,), index, device=x.device, dtype=torch.long)
-            x, h_n, c_n = self.transformer.h(x, block_num)
-
+        for block in self.transformer.trainable_blocks:
+            x = block(x)
+        for block in self.transformer.non_trainable_blocks:
+            x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -301,89 +251,6 @@ class IterativeGPT(nn.Module):
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
-
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {}  # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
-            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
-            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
-        }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024  # always 1024 for GPT model checkpoints
-        config_args['bias'] = True  # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask / buffer, not a param
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """

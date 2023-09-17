@@ -9,6 +9,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from loaders import preprocess_causal_lm
 from models import Transformer
+from quantum_models import QuantumGPT
 from modified_gpt2_model import IterativeGPTConfig, IterativeGPT
 from vanilla_models import VanillaTransformer
 from gpt2_model import GPT, GPTConfig
@@ -31,9 +32,9 @@ def setup(args, accelerator):
         # model = Transformer(len(tokenizer), args.emsize, args.nhead, args.emsize * 4, 0.2, accelerator.device, args.k,
         #                     args.nlayers, args.bptt + 1, new=True)
 
-        config = IterativeGPTConfig(args.bptt + 1, len(tokenizer), args.nlayers, args.nhead, args.emsize, 0.2, k=args.k, factor=args.factor)
-        model = IterativeGPT(config)
-    # model = model.float16()
+        config = GPTConfig(args.bptt + 1, len(tokenizer), args.nlayers, args.nhead, args.emsize, 0.2)
+        model = QuantumGPT(config)
+    model = model.bfloat16()
     # model = torch.compile(model)
     return model, tokenizer
 
@@ -111,8 +112,12 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
             avg_grad.append(_avg_grad)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            if hasattr(model, 'enforce_conservation'):
+                model.enforce_conservation()
             bar.set_postfix(loss=train_loss / counter)
             counter += 1
+        # if hasattr(model, 'switch_trainable_blocks'):
+        #     model.switch_trainable_blocks()
         accelerator.log({"train_loss": train_loss / counter}, step=epoch + 1)
         accelerator.log({"gradient/mean": torch.mean(torch.stack(avg_grad)).item()}, step=epoch + 1)
         accelerator.log({"gradient/max": max_grad.item()}, step=epoch + 1)
