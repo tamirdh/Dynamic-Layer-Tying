@@ -170,11 +170,9 @@ class QuantumGPT(nn.Module):
 
             for trainable_param, non_trainable_param in zip(trainable_block.parameters(),
                                                             non_trainable_block.parameters()):
-                # Calculate the sum of the weights in the trainable parameter
-                weight_sum = trainable_param.data.sum()
 
                 # Update the non-trainable parameter to conserve the sum
-                non_trainable_param.data = weight_sum - trainable_param.data
+                non_trainable_param.data = trainable_param.data
 
                 # Make sure PyTorch doesn't try to update this non-trainable parameter
                 non_trainable_param.requires_grad = False
