@@ -10,10 +10,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass, field
+from typing import Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import transformers
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class LayerNorm(nn.Module):
@@ -139,8 +142,10 @@ class QuantumGPT(nn.Module):
             ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
         # Initially entangle the weights by making them equal
-        for trainable_block, non_trainable_block in zip(self.transformer.trainable_blocks, self.transformer.non_trainable_blocks):
-            for trainable_param, non_trainable_param in zip(trainable_block.parameters(), non_trainable_block.parameters()):
+        for trainable_block, non_trainable_block in zip(self.transformer.trainable_blocks,
+                                                        self.transformer.non_trainable_blocks):
+            for trainable_param, non_trainable_param in zip(trainable_block.parameters(),
+                                                            non_trainable_block.parameters()):
                 # Clone the trainable parameter data to the non-trainable parameter
                 non_trainable_param.data = trainable_param.data.clone()
                 # Make sure PyTorch doesn't try to update this non-trainable parameter
@@ -170,15 +175,16 @@ class QuantumGPT(nn.Module):
 
             for trainable_param, non_trainable_param in zip(trainable_block.parameters(),
                                                             non_trainable_block.parameters()):
-
                 # Update the non-trainable parameter to conserve the sum
                 non_trainable_param.data = trainable_param.data
 
                 # Make sure PyTorch doesn't try to update this non-trainable parameter
                 non_trainable_param.requires_grad = False
+
     def switch_trainable_blocks(self):
         # Switch the trainable status of each entangled pair
-        for trainable_block, non_trainable_block in zip(self.transformer.trainable_blocks, self.transformer.non_trainable_blocks):
+        for trainable_block, non_trainable_block in zip(self.transformer.trainable_blocks,
+                                                        self.transformer.non_trainable_blocks):
             trainable_state_dict = trainable_block.state_dict()
             non_trainable_state_dict = non_trainable_block.state_dict()
 
@@ -190,7 +196,6 @@ class QuantumGPT(nn.Module):
                 param.requires_grad = not param.requires_grad
             for param in non_trainable_block.parameters():
                 param.requires_grad = not param.requires_grad
-
 
     def get_num_params(self, non_embedding=True):
         """
@@ -292,3 +297,241 @@ class QuantumGPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+class DynamicGPT(nn.Module):
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.config = config
+        self.state = [0 for _ in range(config.n_layer)]
+        self.transformer = nn.ModuleDict(dict(
+            wte=nn.Embedding(config.vocab_size, config.n_embd),
+            wpe=nn.Embedding(config.block_size, config.n_embd),
+            drop=nn.Dropout(config.dropout),
+            blocks=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f=LayerNorm(config.n_embd, bias=config.bias),
+        ))
+        # Initially only the first layer should be is trainable
+        for block in self.transformer.blocks[1:]:
+            for param in block.parameters():
+                param.requires_grad = False
+
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
+
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+
+    def get_state(self) -> torch.Tensor:
+        return torch.tensor(self.state, dtype=torch.float)
+
+    def apply_action(self, action: int, layer: int):
+        # list with n_layers actions
+        block = self.transformer.blocks[layer]
+        # if the recommended action is copy from a further down layer: treat it as set to train
+        if action == -1 or action >= layer:
+            for param in block.parameters():
+                param.requires_grad = True
+            self.state[layer] = layer
+        else:
+            copied_block = self.transformer.blocks[action]
+            for copied_param, modified_param in zip(copied_block.parameters(),
+                                                    block.parameters()):
+                # Copy the weights from layer $value
+                modified_param.data = copied_param.data
+
+                # Make sure PyTorch doesn't try to update this non-trainable parameter
+                modified_param.requires_grad = False
+            self.state[layer] = action
+
+    def evaluate_on_samples(self, inputs, targets, loss_func, ntokens):
+        outputs, _ = self(inputs)
+        loss_eval = loss_func(outputs.reshape(-1, ntokens), targets.reshape(-1))
+        ppl = -torch.exp(torch.tensor(loss_eval.item()))
+        return ppl
+
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def crop_block_size(self, block_size):
+        # model surgery to decrease the block size if necessary
+        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+        # but want to use a smaller block size for some smaller, simpler model
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        for block in self.transformer.h:
+            if hasattr(block.attn, 'bias'):
+                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = flops_achieved / flops_promised
+        return mfu
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.blocks:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x)  # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return logits, loss
+
+    def enforce_weights(self):
+        for index, block_state in enumerate(self.state):
+            if block_state == -1:
+                block_state = index
+            if index == block_state:
+                for param in self.transformer.blocks[index].parameters():
+                    param.requires_grad = True
+            else:
+                other_block = self.transformer.blocks[block_state]
+                for copied_param, modified_param in zip(other_block.parameters(),
+                                                        self.transformer.blocks[index].parameters()):
+                    # Copy the weights from layer $value
+                    modified_param.data = copied_param.data.clone()
+
+                    # Make sure PyTorch doesn't try to update this non-trainable parameter
+                    modified_param.requires_grad = False
+
+
+class CustomLLAMA2(transformers.LlamaForCausalLM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.state = [0 for _ in range(len(self.model.layers))]
+        self.custom_post_init()
+
+    def custom_post_init(self):
+        # Initially only the first layer should be is trainable
+        for block in self.model.layers[1:]:
+            for name, param in block.named_parameters():
+                # print(f'param {name} type: {param.dtype}')
+                param.requires_grad = False
+
+    def get_state(self) -> torch.Tensor:
+        return torch.tensor(self.state, dtype=torch.float)
+
+    def apply_action(self, action: int, layer: int):
+        # list with n_layers actions
+        block = self.model.layers[layer]
+        # if the recommended action is copy from a further down layer: treat it as set to train
+        if action == -1 or action >= layer:
+            for name, param in block.named_parameters():
+                # print(f'param {name} type: {param.dtype}')
+                param.requires_grad = True
+            self.state[layer] = layer
+        else:
+            copied_block = self.model.layers[action]
+            for copied_param, modified_param in zip(copied_block.parameters(),
+                                                    block.parameters()):
+                # Copy the weights from layer $value
+                modified_param.data = copied_param.data
+
+                # Make sure PyTorch doesn't try to update this non-trainable parameter
+                modified_param.requires_grad = False
+            self.state[layer] = action
+
+    def evaluate_on_samples(self, inputs, targets, loss_func, ntokens):
+        outputs, _ = self(inputs)
+        loss_eval = loss_func(outputs.reshape(-1, ntokens), targets.reshape(-1))
+        ppl = -torch.exp(torch.tensor(loss_eval.item()))
+        return ppl
+
+    def forward(
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        result = super().forward(input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, labels,
+                                 use_cache, output_attentions, output_hidden_states, return_dict)
+        return result.logits, None
