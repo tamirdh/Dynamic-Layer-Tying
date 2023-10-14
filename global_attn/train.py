@@ -9,25 +9,29 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from loaders import preprocess_causal_lm
 from models import Transformer
-from quantum_models import QuantumGPT
+from quantum_models import QuantumGPT, CustomBert, CustomLLAMA2
 from modified_gpt2_model import IterativeGPTConfig, IterativeGPT
 from vanilla_models import VanillaTransformer
 from gpt2_model import GPT, GPTConfig
 import argparse
 from accelerate.utils import LoggerType
 from torchinfo import summary
-
+from transformers import BertConfig
 
 def setup(args, accelerator):
     tokenizer_id = args.token
     accelerator.print(f'Using {tokenizer_id}\'s tokenizer')
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
     if args.vanilla:
-        model = VanillaTransformer(len(tokenizer), args.emsize, args.nhead, args.nlayers, args.emsize * 4,
-                                   args.bptt + 1, 0.2, 0.2)
+        # model = VanillaTransformer(len(tokenizer), args.emsize, args.nhead, args.nlayers, args.emsize * 4,
+        #                            args.bptt + 1, 0.2, 0.2)
+        model = CustomBert(BertConfig(len(tokenizer), is_decoder=True))
+        args.nlayers = len(model.bert.encoder.layer)
     elif args.gpt:
         config = GPTConfig(args.bptt + 1, len(tokenizer), args.nlayers, args.nhead, args.emsize, 0.2)
         model = GPT(config)
+    elif args.llama:
+        model = CustomLLAMA2(transformers.LlamaConfig(len(tokenizer)))
     else:
         # model = Transformer(len(tokenizer), args.emsize, args.nhead, args.emsize * 4, 0.2, accelerator.device, args.k,
         #                     args.nlayers, args.bptt + 1, new=True)
@@ -59,6 +63,7 @@ def init_args():
     parser.add_argument('--exp', help="Experiment name")
     parser.add_argument("--vanilla", action='store_true', help="Use a vanilla version of Transformers")
     parser.add_argument("--gpt", action='store_true', help="Use a GPT version of Transformers")
+    parser.add_argument("--llama", action="store_true", help="Use the llama model")
     args = parser.parse_args()
     return args
 
@@ -148,6 +153,8 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
                 perplexity_score = torch.exp(torch.tensor([eval_total_loss / counter])).item()
                 if perplexity_score < best_ppl:
                     best_ppl = perplexity_score
+                    if accelerator.is_local_main_process:
+                        accelerator.save(accelerator.unwrap_model(model), 'gpt-model.pt')
                 accelerator.log({'Generated_Text': generated_text}, step=epoch + 1)
                 accelerator.log({f"perplexity_score ({ds})": perplexity_score}, step=epoch + 1)
                 accelerator.log({f"Best PPL ({ds})": best_ppl}, step=epoch + 1)
@@ -159,9 +166,7 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
 
 
 def gen_text(model, tokenizer, text, device):
-    input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
-    generated = model.module.generate(input_ids, 20)
-    generated_text = tokenizer.batch_decode(generated)
+    generated_text = [""]
     return generated_text
 
 
@@ -182,6 +187,8 @@ def main():
         model_name = "Vanilla"
     elif args.gpt:
         model_name = "GPT"
+    elif args.llama:
+        model_name = "LLAMA"
     else:
         model_name = "Mine"
     now = datetime.datetime.now()

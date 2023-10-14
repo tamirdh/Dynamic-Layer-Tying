@@ -1,6 +1,8 @@
 import json
 
-from quantum_models import DynamicGPT, GPTConfig, CustomLLAMA2
+import transformers
+
+from quantum_models import DynamicGPT, GPTConfig, CustomBert, CustomLLAMA2
 import torch
 import datetime
 import torch.nn as nn
@@ -14,8 +16,9 @@ from loaders import preprocess_causal_lm
 from torchinfo import summary
 from tqdm import tqdm
 import torch.distributed as dist
-
-
+from transformers import BertConfig, T5ForConditionalGeneration, T5Config
+import os
+os.environ['NCCL_DEBUG'] = 'INFO'
 def init_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=20, help='training batch size')
@@ -44,7 +47,13 @@ def get_dqn_net(input_dim: int, output_dim: int):
 
 
 def epsilon_greedy_action_selector(qnet: torch.nn.Module, n_layers: int, layer: int, state: torch.Tensor,
-                                   epsilon, device) -> list:
+                                   epsilon, device, episode: int, ablation=False) -> list:
+    if ablation:
+        curr_state = state.tolist()[layer]
+        action_vector = curr_state + 1
+        if action_vector > layer:
+            action_vector = 0
+        return action_vector
     if np.random.rand() < epsilon:
         action_vector = np.random.randint(-1, high=layer)
     else:
@@ -78,6 +87,7 @@ def q_learn_loop(target_model: DynamicGPT, qnet: nn.Module, train_ds: Dataset, t
     target_opt, q_opt, train_loader, test_loader, target_model, qnet = accelerator.prepare(target_opt, q_opt,
                                                                                            train_loader, test_loader,
                                                                                            target_model, qnet)
+    target_model.to(device)
     is_distributed = isinstance(target_model, (nn.DataParallel, nn.parallel.DistributedDataParallel))
     if accelerator.is_local_main_process:
         summary(target_model, input_data=train_ds[0]['input_ids'].unsqueeze(0).to(accelerator.device), depth=3)
@@ -86,12 +96,14 @@ def q_learn_loop(target_model: DynamicGPT, qnet: nn.Module, train_ds: Dataset, t
     epsilon = 1.0
     state = target_model.module.get_state() if is_distributed else target_model.get_state()
     best_ppl = float('inf')
+
     for episode in range(1, args.epochs + 1):
         for layer in range(1, args.nlayers):
             if accelerator.is_local_main_process:
-                action = epsilon_greedy_action_selector(qnet, args.nlayers, layer, state, epsilon, device)
+                action = epsilon_greedy_action_selector(qnet, args.nlayers, layer, state, epsilon, device, episode,
+                                                        ablation=False)
                 action_tensor = torch.tensor([action], dtype=torch.int64).to(device)  # Convert int to tensor
-                state_dict = {int(key): int(value) for key,value in enumerate(state)}
+                state_dict = {int(key): int(value) for key, value in enumerate(state)}
                 # if the state key == value then the layer is trainable
                 number_of_trainable_layers = sum([1 for key, value in state_dict.items() if key == value])
                 with open(f"states-{args.exp}.txt", "a") as f:
@@ -109,13 +121,15 @@ def q_learn_loop(target_model: DynamicGPT, qnet: nn.Module, train_ds: Dataset, t
                 target_model.module.apply_action(action, layer)
             else:
                 target_model.apply_action(action, layer)
+            # target_model.module.enforce_weights() if is_distributed else target_model.enforce_weights()
             target_model.train()
 
             target_model = accelerator.prepare(target_model.module) if is_distributed else accelerator.prepare(
                 target_model)
+            target_model.to(device)
             # multiple training steps per episode
             episode_loss = 0.0
-            limit = 10
+            limit = 4
             bar = tqdm(train_loader, desc=f"train layer {layer}", leave=True,
                        disable=not accelerator.is_local_main_process,
                        total=limit)
@@ -162,13 +176,14 @@ def q_learn_loop(target_model: DynamicGPT, qnet: nn.Module, train_ds: Dataset, t
             # Compute the predicted Q-value
             predicted = qnet(state.to(device))[start_index:end_index][action]
             # Update Q-network
-            q_loss = criterion(predicted, target)
+            q_loss = criterion(predicted.to(device), target.to(device))
             accelerator.log({f"DQN loss": q_loss.item()}, step=episode * args.nlayers + layer)
             accelerator.backward(q_loss)
             q_opt.step()
             state = next_state
         n_trainable = sum(p.numel() for p in target_model.parameters() if p.requires_grad) / 1000000
         accelerator.log({"# trainable params (M)": n_trainable}, step=episode)
+        accelerator.log({"epsilon": epsilon}, step=episode)
         epsilon = max(epsilon * 0.95, 0.01)
 
         # evaluate PPL and accuracy
@@ -195,6 +210,10 @@ def q_learn_loop(target_model: DynamicGPT, qnet: nn.Module, train_ds: Dataset, t
                 perplexity_score = torch.exp(torch.tensor([eval_total_loss / counter])).item()
                 if perplexity_score < best_ppl:
                     best_ppl = perplexity_score
+                if accelerator.is_local_main_process and abs(perplexity_score - best_ppl) < 5 and sum(
+                        [1 if key == value else 0 for key, value in enumerate(state.tolist())]) == 7:
+                    accelerator.print("Saving model at ")
+                    accelerator.save(target_model, "./models")
                 accelerator.log({f"perplexity_score ({ds})": perplexity_score}, step=episode + 1)
                 accelerator.log({f"Best PPL ({ds})": best_ppl}, step=episode + 1)
                 accelerator.print(f'Post epoch {episode + 1} ({ds}): {perplexity_score}')
@@ -236,12 +255,15 @@ def setup_training(args: argparse.Namespace):
     accelerator.init_trackers(f'{model_name}-{now}',
                               config=hps)
     # set up target model & dataset
-    tokenizer_id = args.token if not args.llama else 'meta-llama/Llama-2-7b-hf'
+    tokenizer_id = args.token if not args.llama else 'gpt2-xl'
     accelerator.print(f'Using {tokenizer_id}\'s tokenizer')
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
     config = GPTConfig(args.bptt + 1, len(tokenizer), args.nlayers, args.nhead, args.emsize, 0.2)
-    model = DynamicGPT(config) if not args.llama else CustomLLAMA2.from_pretrained(tokenizer_id)
-    # model = model.bfloat16() if 'cuda' in accelerator.device.type else model
+    # model = DynamicGPT(config) if not args.llama else CustomBert(BertConfig(len(tokenizer), is_decoder=True))
+    model = DynamicGPT(config) if not args.llama else CustomLLAMA2(transformers.LlamaConfig(len(tokenizer)))
+    if args.llama:
+        model.custom_post_init()
+    model = model.bfloat16() if 'cuda' in accelerator.device.type else model
     accelerator.print(f"Using {len(tokenizer):,} different tokens")
     with accelerator.main_process_first():
         train_ds, test_ds = preprocess_causal_lm(tokenizer, args.bptt, args.dataset)

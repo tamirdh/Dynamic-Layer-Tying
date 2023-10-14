@@ -306,16 +306,16 @@ class DynamicGPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        self.state = [0 for _ in range(config.n_layer)]
+        self.state = [0 for i in range(config.n_layer)]
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             wpe=nn.Embedding(config.block_size, config.n_embd),
             drop=nn.Dropout(config.dropout),
-            blocks=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
         # Initially only the first layer should be is trainable
-        for block in self.transformer.blocks[1:]:
+        for block in self.transformer.h[1:]:
             for param in block.parameters():
                 param.requires_grad = False
 
@@ -337,14 +337,14 @@ class DynamicGPT(nn.Module):
 
     def apply_action(self, action: int, layer: int):
         # list with n_layers actions
-        block = self.transformer.blocks[layer]
+        block = self.transformer.h[layer]
         # if the recommended action is copy from a further down layer: treat it as set to train
         if action == -1 or action >= layer:
             for param in block.parameters():
                 param.requires_grad = True
             self.state[layer] = layer
         else:
-            copied_block = self.transformer.blocks[action]
+            copied_block = self.transformer.h[action]
             for copied_param, modified_param in zip(copied_block.parameters(),
                                                     block.parameters()):
                 # Copy the weights from layer $value
@@ -444,7 +444,7 @@ class DynamicGPT(nn.Module):
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.blocks:
+        for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
@@ -464,24 +464,139 @@ class DynamicGPT(nn.Module):
             if block_state == -1:
                 block_state = index
             if index == block_state:
-                for param in self.transformer.blocks[index].parameters():
+                for param in self.transformer.h[index].parameters():
                     param.requires_grad = True
             else:
-                other_block = self.transformer.blocks[block_state]
+                other_block = self.transformer.h[block_state]
                 for copied_param, modified_param in zip(other_block.parameters(),
-                                                        self.transformer.blocks[index].parameters()):
+                                                        self.transformer.h[index].parameters()):
                     # Copy the weights from layer $value
                     modified_param.data = copied_param.data.clone()
 
                     # Make sure PyTorch doesn't try to update this non-trainable parameter
                     modified_param.requires_grad = False
 
+    @classmethod
+    def from_pretrained(cls, model_type, override_args=None):
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        override_args = override_args or {}  # default to empty dict
+        # only dropout can be overridden see more notes below
+        assert all(k == 'dropout' for k in override_args)
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        # n_layer, n_head and n_embd are determined from model_type
+        config_args = {
+            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
+            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
+            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
+        }[model_type]
+        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024  # always 1024 for GPT model checkpoints
+        config_args['bias'] = True  # always True for GPT model checkpoints
+        # we can override the dropout rate, if desired
+        if 'dropout' in override_args:
+            print(f"overriding dropout rate to {override_args['dropout']}")
+            config_args['dropout'] = override_args['dropout']
+        # create a from-scratch initialized minGPT model
+        config = GPTConfig(**config_args)
+        model = DynamicGPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask / buffer, not a param
+
+        # init a huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+        for param in model.transformer.h[0].parameters():
+            param.requires_grad = True
+        for block in model.transformer.h[1:]:
+            for param in block.parameters():
+                param.requires_grad = False
+        return model
+
+
+class CustomBert(transformers.BertLMHeadModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.state = [0 for _ in range(len(self.bert.encoder.layer))]
+        # self.custom_post_init()
+
+    def custom_post_init(self):
+        # Initially only the first layer should be is trainable
+        for block in self.bert.encoder.layer[1:]:
+            for name, param in block.named_parameters():
+                # print(f'param {name} type: {param.dtype}')
+                param.requires_grad = False
+
+    def get_state(self) -> torch.Tensor:
+        return torch.tensor(self.state, dtype=torch.float)
+
+    def apply_action(self, action: int, layer: int):
+        # list with n_layers actions
+        block = self.bert.encoder.layer[layer]
+        # if the recommended action is copy from a further down layer: treat it as set to train
+        if action == -1 or action >= layer:
+            for name, param in block.named_parameters():
+                # print(f'param {name} type: {param.dtype}')
+                param.requires_grad = True
+            self.state[layer] = layer
+        else:
+            copied_block = self.bert.encoder.layer[action]
+            for copied_param, modified_param in zip(copied_block.parameters(),
+                                                    block.parameters()):
+                # Copy the weights from layer $value
+                modified_param.data = copied_param.data
+
+                # Make sure PyTorch doesn't try to update this non-trainable parameter
+                modified_param.requires_grad = False
+            self.state[layer] = action
+
+    def evaluate_on_samples(self, inputs, targets, loss_func, ntokens):
+        outputs, _ = self(inputs)
+        loss_eval = loss_func(outputs.reshape(-1, ntokens), targets.reshape(-1))
+        ppl = -torch.exp(torch.tensor(loss_eval.item()))
+        return ppl
+
+    def forward(self, input_ids: torch.LongTensor = None, attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                past_key_values: Optional[List[torch.FloatTensor]] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None, labels: Optional[torch.LongTensor] = None,
+                use_cache: Optional[bool] = None, output_attentions: Optional[bool] = None,
+                output_hidden_states: Optional[bool] = None, return_dict: Optional[bool] = None, **kwargs) -> Union[
+        Tuple, CausalLMOutputWithPast]:
+        result = super().forward(input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, labels,
+                                 use_cache, output_attentions, output_hidden_states, return_dict)
+        return result.logits, None
+
 
 class CustomLLAMA2(transformers.LlamaForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         self.state = [0 for _ in range(len(self.model.layers))]
-        self.custom_post_init()
+        # self.custom_post_init()
 
     def custom_post_init(self):
         # Initially only the first layer should be is trainable
@@ -519,19 +634,13 @@ class CustomLLAMA2(transformers.LlamaForCausalLM):
         ppl = -torch.exp(torch.tensor(loss_eval.item()))
         return ppl
 
-    def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    def forward(self, input_ids: torch.LongTensor = None, attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                past_key_values: Optional[List[torch.FloatTensor]] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None, labels: Optional[torch.LongTensor] = None,
+                use_cache: Optional[bool] = None, output_attentions: Optional[bool] = None,
+                output_hidden_states: Optional[bool] = None, return_dict: Optional[bool] = None, **kwargs) -> Union[
+        Tuple, CausalLMOutputWithPast]:
         result = super().forward(input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, labels,
                                  use_cache, output_attentions, output_hidden_states, return_dict)
         return result.logits, None
