@@ -85,6 +85,20 @@ def train_language_modeling(model, train_dataset, eval_dataset, tokenizer, args,
     accelerator.print(f'LEN TEST: {len(test_loader.dataset)}')
     best_ppl = float('inf')
     for epoch in range(args.epochs):
+        total_memory_used = 0
+
+        # Iterate over all GPUs and sum their memory allocations
+        num_gpus = torch.cuda.device_count()
+        for gpu_id in range(num_gpus):
+            torch.cuda.set_device(gpu_id)
+            total_memory_used += torch.cuda.memory_allocated()
+
+        # Convert the total memory from bytes to megabytes
+        total_memory_used_mb = total_memory_used / 1000000
+
+        # Write the total memory used to the file
+        with open(f'mem-{args.exp}.txt', 'a') as f:
+            f.write(f"{total_memory_used_mb}\n")
         model.train()
         bar = tqdm(train_loader, desc="TRAIN", leave=True, disable=not accelerator.is_local_main_process)
         counter = 1

@@ -52,3 +52,19 @@ def preprocess_causal_lm(tokenizer, bptt: int, ds_name: str):
     eval_encodings = eval_texts.map(tokenization, batched=True, remove_columns=eval_texts.column_names,
                                     num_proc=8).map(group_texts, batched=True, num_proc=8)
     return train_encodings, eval_encodings
+
+
+def preprocess_images(ds_name: str, image_processor):
+    def transform(example):
+        inputs = image_processor(example['img'], return_tensors='pt')
+        inputs['labels'] = example['label']
+        return inputs
+
+    if ds_name == "cifar":
+        dataset = load_dataset('cifar10')
+    else:
+        raise RuntimeError(f"Unrecognized DS name: {ds_name}")
+    train_imgs, eval_imgs = dataset['train'], dataset['test']
+    train_ds = train_imgs.map(transform, batched=True, remove_columns=train_imgs.column_names, num_proc=1)
+    test_ds = eval_imgs.map(transform, batched=True, remove_columns=train_imgs.column_names, num_proc=1)
+    return train_ds, test_ds

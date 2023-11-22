@@ -644,3 +644,64 @@ class CustomLLAMA2(transformers.LlamaForCausalLM):
         result = super().forward(input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, labels,
                                  use_cache, output_attentions, output_hidden_states, return_dict)
         return result.logits, None
+
+
+class CustomVit(transformers.ViTForImageClassification):
+    def __init__(self, config):
+        super().__init__(config)
+        self.state = [0 for _ in range(len(self.vit.encoder.layer))]
+
+    def custom_post_init(self):
+        # Initially only the first layer should be is trainable
+        for block in self.vit.encoder.layer[1:]:
+            for name, param in block.named_parameters():
+                # print(f'param {name} type: {param.dtype}')
+                param.requires_grad = False
+
+    def get_state(self) -> torch.Tensor:
+        return torch.tensor(self.state, dtype=torch.float)
+
+    def apply_action(self, action: int, layer: int):
+        # list with n_layers actions
+        block = self.vit.encoder.layer[layer]
+        # if the recommended action is copy from a further down layer: treat it as set to train
+        if action == -1 or action >= layer:
+            for name, param in block.named_parameters():
+                # print(f'param {name} type: {param.dtype}')
+                param.requires_grad = True
+            self.state[layer] = layer
+        else:
+            copied_block = self.vit.encoder.layer[action]
+            for copied_param, modified_param in zip(copied_block.parameters(),
+                                                    block.parameters()):
+                # Copy the weights from layer $value
+                modified_param.data = copied_param.data
+
+                # Make sure PyTorch doesn't try to update this non-trainable parameter
+                modified_param.requires_grad = False
+            self.state[layer] = action
+
+    def evaluate_on_samples(self, inputs, targets, loss_func, ntokens):
+        outputs, _ = self(inputs)
+        predictions = outputs.argmax(dim=-1).tolist()
+        accuracy = 0.0
+        targets = targets.tolist()
+        for index, value in enumerate(predictions):
+            if value == targets[index]:
+                accuracy += 1
+        accuracy = accuracy / len(predictions)
+        return -accuracy
+
+    def forward(self,
+                pixel_values: Optional[torch.Tensor] = None,
+                head_mask: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None,
+                output_attentions: Optional[bool] = None,
+                output_hidden_states: Optional[bool] = None,
+                interpolate_pos_encoding: Optional[bool] = None,
+                return_dict: Optional[bool] = None,
+                ):
+        result = super().forward(pixel_values, head_mask, labels, output_attentions, output_hidden_states,
+                                 interpolate_pos_encoding,
+                                 return_dict)
+        return result.logits, None
