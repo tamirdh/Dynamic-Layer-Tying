@@ -54,6 +54,117 @@ def preprocess_causal_lm(tokenizer, bptt: int, ds_name: str):
     return train_encodings, eval_encodings
 
 
+def preprocess_squad(tokenizer, ds_name: str, bptt: int):
+    def tokenization_and_align_labels(examples):
+        # Adjustments here
+        tokenized_inputs = tokenizer(examples['context'], examples['question'],
+                                     truncation=True, padding='max_length', max_length=bptt,
+                                     return_offsets_mapping=True)
+
+        start_positions = []
+        end_positions = []
+
+        for i in range(len(examples['context'])):
+            start_char = examples['answers'][i]['answer_start'][0] if examples['answers'][i]['answer_start'] else 0
+            end_char = start_char + len(examples['answers'][i]['text'][0]) if examples['answers'][i]['text'] else 0
+
+            tokenized_context = tokenizer(examples['context'][i], truncation=True, padding='max_length',
+                                          max_length=bptt,
+                                          return_offsets_mapping=True)
+
+            offsets = tokenized_context.offset_mapping
+
+            start_token_idx = next((idx for idx, offset in enumerate(offsets) if offset[0] <= start_char < offset[1]),
+                                   None)
+            end_token_idx = next((idx for idx, offset in enumerate(offsets) if offset[0] < end_char <= offset[1]), None)
+
+            # Adjust positions for None values
+            if start_token_idx is None or end_token_idx is None or end_token_idx >= bptt:
+                context = examples['context'][i]
+                new_start = max(0, start_char - (bptt - min(bptt, len(tokenizer.tokenize(examples['question'][i])))))
+                new_end = min(len(context),
+                              end_char + (bptt - min(bptt, len(tokenizer.tokenize(examples['question'][i])))))
+                adjusted_context = context[new_start:new_end]
+
+                tokenized_adjusted = tokenizer(adjusted_context, examples['question'][i],
+                                               truncation=True, padding='max_length',
+                                               max_length=bptt, return_offsets_mapping=True)
+
+                offsets_adjusted = tokenized_adjusted.offset_mapping
+                start_token_idx = next((idx for idx, offset in enumerate(offsets_adjusted) if
+                                        offset[0] <= start_char - new_start < offset[1]), None)
+                end_token_idx = next((idx for idx, offset in enumerate(offsets_adjusted) if
+                                      offset[0] < end_char - new_start <= offset[1]), None)
+
+            start_positions.append(start_token_idx if start_token_idx is not None else tokenizer.cls_token_id)
+            end_positions.append(end_token_idx if end_token_idx is not None else tokenizer.cls_token_id)
+
+        tokenized_inputs['start_positions'] = start_positions
+        tokenized_inputs['end_positions'] = end_positions
+        return tokenized_inputs
+
+    if ds_name == "squad":
+        dataset = load_dataset("squad")
+    elif ds_name == "squad_v2":
+        dataset = load_dataset("squad_v2")
+    else:
+        raise RuntimeError(f"Unrecognized DS name: {ds_name}")
+
+    train_dataset, eval_dataset = dataset['train'], dataset['validation']
+    train_dataset = train_dataset.map(tokenization_and_align_labels, batched=True)
+    eval_dataset = eval_dataset.map(tokenization_and_align_labels, batched=True)
+
+    return train_dataset, eval_dataset
+
+
+def preprocess_glue_sst2(tokenizer, bptt: int, dataset_name: str):
+    def tokenization_and_convert_labels(examples):
+        # Tokenization
+        tokenized_inputs = tokenizer(examples['sentence'], padding='max_length',
+                                     truncation=True, max_length=bptt)
+        # Convert labels
+        tokenized_inputs['labels'] = [label for label in examples['label']]
+        return tokenized_inputs
+
+    # Load dataset
+    dataset = load_dataset("glue", dataset_name)
+
+    train_dataset, eval_dataset = dataset['train'], dataset['validation']
+
+    # Apply the preprocessing
+    train_dataset = train_dataset.map(tokenization_and_convert_labels, batched=True)
+    eval_dataset = eval_dataset.map(tokenization_and_convert_labels, batched=True)
+
+    return train_dataset, eval_dataset
+
+
+def preprocess_glue_single_and_pair(tokenizer, bptt: int, dataset_name: str, pair: bool = False,
+                                    keys: tuple = (None, None)):
+    def tokenization_and_convert_labels(examples):
+        # Tokenization
+        if pair:
+            tokenized_inputs = tokenizer(examples[keys[0]], examples[keys[1]],
+                                         padding='max_length', truncation=True, max_length=bptt)
+        else:
+            tokenized_inputs = tokenizer(examples['sentence'], padding='max_length',
+                                         truncation=True, max_length=bptt)
+
+        # Convert labels
+        tokenized_inputs['labels'] = [label for label in examples['label']]
+        return tokenized_inputs
+
+    # Load dataset
+    dataset = load_dataset("glue", dataset_name)
+
+    train_dataset, eval_dataset = dataset['train'], dataset['test'] if dataset_name!="rte" else dataset['validation']
+
+    # Apply the preprocessing
+    train_dataset = train_dataset.map(tokenization_and_convert_labels, batched=True)
+    eval_dataset = eval_dataset.map(tokenization_and_convert_labels, batched=True)
+
+    return train_dataset, eval_dataset
+
+
 def preprocess_images(ds_name: str, image_processor):
     def transform(example):
         inputs = image_processor(example['img'], return_tensors='pt')

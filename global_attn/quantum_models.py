@@ -332,6 +332,17 @@ class DynamicGPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
+    def switch_to_labels_head(self, n_labels):
+        og_type = self.lm_head.weight.dtype
+        self.lm_head = nn.Linear(self.config.n_embd, n_labels, bias=False)
+        if og_type == torch.bfloat16:
+            self.lm_head = self.lm_head.bfloat16()
+
+    def switch_to_sst2_head(self):
+        og_type = self.lm_head.weight.dtype
+        self.lm_head = nn.Linear(self.config.n_embd, 1, bias=False)
+        if og_type == torch.bfloat16:
+            self.lm_head = self.lm_head.bfloat16()
     def get_state(self) -> torch.Tensor:
         return torch.tensor(self.state, dtype=torch.float)
 
@@ -354,11 +365,58 @@ class DynamicGPT(nn.Module):
                 modified_param.requires_grad = False
             self.state[layer] = action
 
-    def evaluate_on_samples(self, inputs, targets, loss_func, ntokens):
-        outputs, _ = self(inputs)
-        loss_eval = loss_func(outputs.reshape(-1, ntokens), targets.reshape(-1))
-        ppl = -torch.exp(torch.tensor(loss_eval.item()))
-        return ppl
+    def evaluate_on_samples(self, inputs, targets, loss_func, ntokens, sst2=False):
+        if sst2:
+            outputs, _ = self(inputs)
+            loss_eval = loss_func(outputs[:, -1, :].squeeze(-1), targets.to(dtype=outputs.dtype))
+            ppl = -torch.exp(torch.tensor(loss_eval.item()))
+            return ppl
+        if type(targets) != tuple:
+            outputs, _ = self(inputs)
+            loss_eval = loss_func(outputs.reshape(-1, ntokens), targets.reshape(-1))
+            ppl = -torch.exp(torch.tensor(loss_eval.item()))
+            return ppl
+        else:
+            # squad evaluation should be the F1 score
+            outputs, _ = self(inputs)
+            start_logits, end_logits = outputs.split(1, dim=-1)
+            start_logits = start_logits.squeeze(-1)
+            end_logits = end_logits.squeeze(-1)
+            # Predicted positions
+            predicted_start = torch.argmax(start_logits, dim=1)
+            predicted_end = torch.argmax(end_logits, dim=1)
+
+            # True labels
+            true_start, true_end = targets
+
+            # True Positives, False Positives, and False Negatives for start and end
+            TP_start = (predicted_start == true_start).sum().item()
+            FP_start = (predicted_start != true_start).sum().item()
+            FN_start = (true_start != predicted_start).sum().item()
+
+            TP_end = (predicted_end == true_end).sum().item()
+            FP_end = (predicted_end != true_end).sum().item()
+            FN_end = (true_end != predicted_end).sum().item()
+
+            # Precision and Recall for start and end
+            precision_start = TP_start / (TP_start + FP_start)
+            recall_start = TP_start / (TP_start + FN_start)
+
+            precision_end = TP_end / (TP_end + FP_end)
+            recall_end = TP_end / (TP_end + FN_end)
+
+            def calculate_f1(precision, recall):
+                if precision + recall == 0:
+                    return 0.0
+                return 2 * (precision * recall) / (precision + recall)
+
+            F1_start = calculate_f1(precision_start, recall_start)
+            F1_end = calculate_f1(precision_end, recall_end)
+
+            # Average F1 Score
+            F1_score = (F1_start + F1_end) / 2
+            return torch.tensor(F1_score).to(inputs.device)
+
 
     def get_num_params(self, non_embedding=True):
         """
